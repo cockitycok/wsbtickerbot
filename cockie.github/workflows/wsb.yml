@@ -1,0 +1,207 @@
+name: WSB → Discord (hourly)
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # cada hora (UTC)
+  workflow_dispatch: {}    # permite lanzarlo a mano
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Cache para recordar deltas hora a hora y máximos del día
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: wsb-agent-cache
+
+      - name: Run WSB scan and send to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          mkdir -p .cache
+          node - <<'JS'
+          const fs = require('fs');
+          const path = require('path');
+          const STATE_PATH = path.join('.cache','wsb_state.json');
+          const WEBHOOK = process.env.DISCORD_WEBHOOK;
+          if(!WEBHOOK){ console.error('Falta DISCORD_WEBHOOK'); process.exit(1); }
+
+          const UA = {'User-Agent':'WSB-Hourly-Agent/1.0 (+github actions)'};
+          const STOP = new Set(`YOLO ATH EPS CEO SEC CPI PCE TTM IV ATM ITM OTM ROI CAGR DD GDP IMO LOL LMAO RH
+          MOASS HODL FOMO CALL PUT CALLS PUTS TENDIES DIAMOND HANDS ROCKET ROCKETS YOLOs YOLOED PNL`.trim().split(/\s+/));
+          const TICKER_RE = /\b[A-Z]{2,5}\b/g;
+
+          async function fetchJson(url){
+            const r = await fetch(url, {headers: UA});
+            if(!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
+            return await r.json();
+          }
+          async function fetchText(url){
+            const r = await fetch(url, {headers: UA});
+            if(!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
+            return await r.text();
+          }
+          function extractTickers(text){
+            const up = (text||'').toUpperCase();
+            const raw = up.match(TICKER_RE)||[];
+            const uniq = [...new Set(raw)];
+            return uniq.filter(t => !STOP.has(t) && !/^\d+$/.test(t));
+          }
+          function loadState(){
+            try { return JSON.parse(fs.readFileSync(STATE_PATH,'utf-8')); }
+            catch { return { last_mentions:{}, day_high:{}, last_run:null }; }
+          }
+          function saveState(s){ fs.writeFileSync(STATE_PATH, JSON.stringify(s,null,2)); }
+
+          async function fetchHot(limit=25){
+            const j = await fetchJson("https://www.reddit.com/r/wallstreetbets/hot.json?limit=100");
+            const items = (j?.data?.children||[])
+              .map(c => c?.data)
+              .filter(Boolean)
+              .slice(0, limit)
+              .map(d => ({
+                id: d.id,
+                title: d.title||'',
+                selftext: d.selftext||'',
+                score: d.score||0,
+                url: "https://www.reddit.com"+(d.permalink||''),
+                permalink: d.permalink||'',
+                created_utc: d.created_utc||0
+              }));
+            return items;
+          }
+
+          async function fetchComments(permalink, maxComments=60){
+            try{
+              const arr = await fetchJson(`https://www.reddit.com${permalink}.json`);
+              const list = [];
+              const comments = arr?.[1]?.data?.children || [];
+              for(const c of comments){
+                const body = c?.data?.body;
+                if(body) list.push(body);
+                if(list.length >= maxComments) break;
+              }
+              return list;
+            }catch(e){ return []; }
+          }
+
+          async function postDiscord(content){
+            await fetch(WEBHOOK, {
+              method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({ content })
+            });
+          }
+
+          function fmtTS(d){
+            const pad = n=>String(n).padStart(2,'0');
+            return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())} Europe/Madrid`;
+          }
+
+          (async () => {
+            // 1) Posts HOT (cap 25 para no pasarnos)
+            let posts = [];
+            try { posts = await fetchHot(25); } catch {}
+            if(posts.length === 0){
+              // Fallback RSS (solo títulos)
+              try {
+                const rss = await fetchText("https://www.reddit.com/r/wallstreetbets/.rss");
+                const titles = [...rss.matchAll(/<title>(.*?)<\/title>/gis)].map(m=>m[1]);
+                posts = titles.map(t=>({title:t,selftext:'',score:0,url:'https://www.reddit.com/r/wallstreetbets',permalink:''}));
+              } catch {}
+            }
+
+            // 2) Tickers desde posts + (algunos) comentarios
+            const mentions = new Map();
+            const examples = new Map();
+            for(const p of posts){
+              let tickers = new Set(extractTickers(`${p.title} ${p.selftext}`));
+              if(p.permalink){
+                const comm = await fetchComments(p.permalink, 60);
+                for(const body of comm){ extractTickers(body).forEach(t=> tickers.add(t)); }
+              }
+              if(tickers.size>0){
+                for(const t of tickers){
+                  mentions.set(t,(mentions.get(t)||0)+1); // 1 por post si aparece en post o sus comments
+                  if(!examples.has(t)) examples.set(t,[]);
+                  const arr = examples.get(t);
+                  if(arr.length<2) arr.push([p.score||0, p.title.slice(0,140), p.url]);
+                }
+              }
+            }
+
+            // 3) Deltas vs hora previa + máximos del día
+            const state = loadState();
+            const prev = state.last_mentions||{};
+            const dayHigh = state.day_high||{};
+            const top = [...mentions.entries()].sort((a,b)=>b[1]-a[1]).slice(0,10);
+
+            const broken = [];
+            for(const [t,c] of mentions.entries()){
+              const prevHigh = dayHigh[t]||0;
+              if(c>prevHigh){ dayHigh[t]=c; if(prevHigh>0) broken.push(t); }
+            }
+
+            // 4) Mensaje
+            const now = new Date();
+            const lines = [];
+            lines.push(`WSB hourly scan — ${fmtTS(now)}`);
+
+            if(top.length===0){
+              lines.push("No hubo menciones significativas en la última hora.");
+            }else{
+              lines.push("Top 10 tickers por menciones (Δ vs hora previa):");
+              const spikes = [];
+              for(const [t,c] of top){
+                const p = prev[t]||0;
+                const delta = c - p;
+                const pct = p ? `${Math.round(100*(c-p)/p)}%` : "new";
+                const sign = delta>=0?"+":"";
+                lines.push(`• ${t}: ${c} (${sign}${delta}, ${pct})`);
+                if(p && c>=2*p) spikes.push(t); // >100% HoH
+              }
+              if(spikes.length){ lines.push(""); lines.push("⚠️ Spikes (>100% HoH): "+spikes.join(", ")); }
+              if(broken.length){ lines.push(""); lines.push("📈 Break day high: "+broken.join(", ")); }
+
+              lines.push("");
+              for(const [t] of top.slice(0,3)){
+                const arr = examples.get(t)||[];
+                if(arr.length){
+                  lines.push(`${t} — ejemplos:`);
+                  for(const [sc,title,url] of arr){
+                    lines.push(`  · (${sc}) ${title} — ${url}`);
+                  }
+                }
+              }
+            }
+
+            // 5) Envío
+            await postDiscord(lines.join("\n"));
+
+            // 6) Guarda estado
+            const obj = {}; for(const [t,c] of mentions) obj[t]=c;
+            fs.mkdirSync('.cache', {recursive:true});
+            saveState({ last_mentions: obj, day_high: dayHigh, last_run: now.toISOString() });
+          })().catch(async e=>{
+            try{
+              await fetch(WEBHOOK,{
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({content:`WSB agent error: ${e?.message||e}`})
+              });
+            }catch{}
+            process.exit(1);
+          });
+          JS
+
+      - name: Save cache
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: wsb-agent-cache
